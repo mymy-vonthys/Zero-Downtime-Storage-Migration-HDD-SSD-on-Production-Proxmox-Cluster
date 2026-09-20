@@ -7,197 +7,197 @@
 ## TL;DR
 
 | | |
-| --- | --- |
-| **Masalah** | Server produksi mengalami I/O Delay 78%, Load Average >35, SWAP hampir penuh (99.97%) |
-| **Constraint** | Tidak boleh downtime - 9 VM/CT sedang aktif melayani produksi (database, CI/CD, backup server, dll) |
-| **Solusi** | Live block-mirror migration (`qm disk move`) dari HDD ke SSD, dikombinasikan dengan brief-downtime untuk LXC container (limitasi platform) |
-| **Hasil** | I/O Delay turun ke 0.17%, Load Average turun ke ~1.1, SWAP usage turun ke 0.52% |
-| **Data loss** | Nol - seluruh data tervalidasi utuh pasca migrasi |
-| **Status akhir** | Konsolidasi tuntas ke 1 SSD; SSD kedua direpurpose untuk ekspansi multi-server |
+|---|---|
+| **Problem** | Production server suffering from 78% I/O Delay, Load Average >35, SWAP nearly full (99.97%) |
+| **Constraint** | Zero downtime required — 9 VMs/CTs actively serving production (database, CI/CD, backup server, etc.) |
+| **Solution** | Live block-mirror migration (`qm disk move`) from HDD to SSD, combined with brief planned downtime for LXC containers (platform limitation) |
+| **Result** | I/O Delay dropped to 0.17%, Load Average down to ~1.1, SWAP usage down to 0.52% |
+| **Data loss** | Zero — all data verified intact post-migration |
+| **Final state** | Fully consolidated onto a single SSD; second SSD repurposed for multi-server expansion |
 
 ---
 
-## Daftar Isi
+## Table of Contents
 
-- [Latar Belakang](#latar-belakang)
-- [Constraint & Tantangan Awal](#constraint--tantangan-awal)
-- [Arsitektur Sebelum & Sesudah](#arsitektur-sebelum--sesudah)
-- [Pendekatan Teknis](#pendekatan-teknis)
-- [Eksekusi](#eksekusi)
-- [Insiden & Cara Penyelesaian](#insiden--cara-penyelesaian)
-- [Hasil](#hasil)
-- [Fase 2: Observability & Proactive Monitoring](#fase-2-observability--proactive-monitoring)
-- [Fase 3: Konsolidasi ke Single-SSD & Repurposing](#fase-3-konsolidasi-ke-single-ssd--repurposing)
+- [Background](#background)
+- [Constraints & Initial Challenges](#constraints--initial-challenges)
+- [Architecture Before & After](#architecture-before--after)
+- [Technical Approach](#technical-approach)
+- [Execution](#execution)
+- [Incidents & Resolutions](#incidents--resolutions)
+- [Results](#results)
+- [Phase 2: Observability & Proactive Monitoring](#phase-2-observability--proactive-monitoring)
+- [Phase 3: Single-SSD Consolidation & Repurposing](#phase-3-single-ssd-consolidation--repurposing)
 - [Lessons Learned](#lessons-learned)
 - [Tech Stack](#tech-stack)
-- [Tindak Lanjut](#tindak-lanjut)
+- [Next Steps](#next-steps)
 
 ---
 
-## Latar Belakang
+## Background
 
-Server produksi (Dell PowerEdge T440, Proxmox VE, 16 core Xeon Silver 4110) menjalankan 9 workload produksi - kombinasi Windows Server (database & aplikasi bisnis) dan Linux container (CI/CD engine, reverse proxy, backup server, DNS remap) - di atas 2x HDD berkapasitas besar.
+The production server (Dell PowerEdge T440, Proxmox VE, 16-core Xeon Silver 4110) ran 9 production workloads — a mix of Windows Server VMs (databases & business applications) and Linux containers (CI/CD engine, reverse proxy, backup server, DNS remap) — on top of 2x large-capacity HDDs.
 
-Gejala yang muncul:
-- Aplikasi terasa lambat, terutama saat beban I/O tinggi (backup berjalan, build CI/CD)
-- Dashboard Proxmox menunjukkan **I/O Delay 78.25%** dan **Load Average 35.79** - jauh di atas normal untuk CPU usage yang sebenarnya hanya 17.98%
-- **SWAP usage 99.97%** - indikasi tekanan memori kronis
+Observed symptoms:
+- Applications felt sluggish, especially during high I/O periods (backups running, CI/CD builds)
+- Proxmox dashboard showed **78.25% I/O Delay** and **35.79 Load Average** — far above normal for an actual CPU usage of only 17.98%
+- **99.97% SWAP usage** — indicating chronic memory pressure
 
-Diagnosis awal: kombinasi **HDD sebagai bottleneck I/O** dan **RAM tidak mencukupi**, menyebabkan sistem terus-menerus menunggu disk dan swapping ke disk yang sama-sama lambat - siklus yang saling memperburuk.
+Initial diagnosis: a combination of **HDD as the I/O bottleneck** and **insufficient RAM**, causing the system to constantly wait on disk and swap to the same slow disk — a self-reinforcing degradation loop.
 
-## Constraint & Tantangan Awal
+## Constraints & Initial Challenges
 
-1. **Zero-downtime wajib** - seluruh VM/CT sedang melayani produksi aktif, termasuk database dan sistem backup terjadwal (07:00, 15:00, 23:00)
-2. **Tidak ada jendela maintenance panjang** di awal proyek
-3. **Hardware SSD baru** perlu dipasang dan diintegrasikan tanpa mematikan server produksi
+1. **Zero-downtime was mandatory** — all VMs/CTs were actively serving production, including databases and a scheduled backup system (07:00, 15:00, 23:00)
+2. **No long maintenance window available** at the start of the project
+3. **New SSD hardware** had to be installed and integrated without powering down the production server
 
-## Arsitektur Sebelum & Sesudah
+## Architecture Before & After
 
 ```mermaid
 graph TB
-    subgraph "Sebelum"
-        A1[HDD 1<br/>OS + sebagian VM] 
-        A2[HDD 2<br/>Bulk data VM/CT + Backup]
+    subgraph "Before"
+        A1[HDD 1<br/>OS + some VMs] 
+        A2[HDD 2<br/>Bulk VM/CT data + Backups]
     end
-    subgraph "Sesudah"
-        B1[SSD 1<br/>OS Proxmox]
-        B2[SSD 2<br/>Seluruh data VM/CT]
+    subgraph "After"
+        B1[SSD 1<br/>Proxmox OS]
+        B2[SSD 2<br/>All VM/CT data]
     end
-    A1 -.migrasi live block-mirror.-> B2
-    A2 -.migrasi live block-mirror.-> B2
+    A1 -.live block-mirror migration.-> B2
+    A2 -.live block-mirror migration.-> B2
 ```
 
-**Storage layout akhir (fase ini):**
+**Storage layout at this stage:**
 
-| Storage | Fungsi | Isi |
+| Storage | Purpose | Contents |
 |---|---|---|
-| SSD A (`local-lvm`) | OS Proxmox host | Root filesystem, swap |
-| SSD B (`ssd-storage`, LVM-Thin) | Data VM/Container | 3x Windows VM (100GB masing-masing), 6x LXC Container (8GB–1TB) |
+| SSD A (`local-lvm`) | Proxmox host OS | Root filesystem, swap |
+| SSD B (`ssd-storage`, LVM-Thin) | VM/Container data | 3x Windows VMs (100GB each), 6x LXC Containers (8GB–1TB) |
 
-> **Catatan strategi:** instalasi OS ke SSD A dan proses cloning VM/CT ke SSD B dilakukan **paralel** (bersamaan), bukan berurutan - menghemat waktu total migrasi karena kedua proses tidak saling bergantung.
+> **Strategy note:** installing the OS onto SSD A and cloning VMs/CTs onto SSD B were run **in parallel**, not sequentially — saving total migration time since the two processes had no dependency on each other.
 
-## Pendekatan Teknis
+## Technical Approach
 
-Dipilih **live block-mirror** (`qm disk move` untuk VM, `pct move-volume` untuk container) alih-alih pendekatan backup-reinstall-restore konvensional, karena:
+**Live block-mirror** (`qm disk move` for VMs, `pct move-volume` for containers) was chosen over a conventional backup-reinstall-restore approach, because:
 
-| Pendekatan | Downtime | Kompleksitas | Risiko |
+| Approach | Downtime | Complexity | Risk |
 |---|---|---|---|
-| Backup → reinstall → restore | Tinggi (jam) | Rendah | Rendah, tapi tidak memenuhi constraint |
-| **Live block-mirror** ✅ | Mendekati nol (untuk VM) | Tinggi | Perlu penanganan edge case dengan hati-hati |
-| Storage replication (DRBD/ZFS send) | Nol | Sangat tinggi | Overkill untuk migrasi satu kali |
+| Backup → reinstall → restore | High (hours) | Low | Low, but doesn't meet the constraint |
+| **Live block-mirror** ✅ | Near-zero (for VMs) | High | Requires careful edge-case handling |
+| Storage replication (DRBD/ZFS send) | Zero | Very high | Overkill for a one-time migration |
 
-**Cara kerja live block-mirror:**
-1. Disk baru dibuat kosong di storage tujuan
-2. Data lama disalin penuh ke disk baru
-3. Selama proses penyalinan, setiap write baru dari VM di-mirror ke KEDUA disk (lama & baru) secara sinkron
-4. Setelah sinkron penuh, terjadi cutover atomik - VM otomatis dialihkan ke disk baru tanpa restart
-5. Disk lama menjadi statis (tidak lagi menerima update)
+**How live block-mirror works:**
+1. A new empty disk is created on the destination storage
+2. Existing data is fully copied to the new disk
+3. During the copy, every new write from the VM is mirrored to BOTH disks (old & new) synchronously
+4. Once fully synced, an atomic cutover occurs — the VM is switched to the new disk without a restart
+5. The old disk becomes static (no longer receives updates)
 
-> **Catatan penting:** pendekatan ini tidak berlaku untuk seluruh komponen. Container LXC dan TPM state (virtual TPM untuk Windows) **tidak mendukung live-move** di Proxmox - keduanya memerlukan proses berhenti sejenak. Ini ditangani dengan menjadwalkan brief-downtime terpisah untuk komponen tersebut, dipisah dari komponen yang bisa live-migrate.
+> **Important caveat:** this approach doesn't apply to every component. LXC containers and TPM state (virtual TPM for Windows) **do not support live-move** in Proxmox — both require a brief stop. This was handled by scheduling separate brief-downtime windows for those components, decoupled from the components that could be live-migrated.
 
-## Eksekusi
+## Execution
 
 ```mermaid
 flowchart LR
-    A[Audit storage & baseline metrics] --> B[Pasang SSD baru]
-    B --> C[Live-migrate disk VM<br/>zero downtime]
-    C --> D[Brief-downtime:<br/>container + TPM state]
-    D --> E[Verifikasi integritas<br/>tiap VM/CT]
-    E --> F[Cleanup orphan disk]
-    F --> G[Dokumentasi & monitoring]
+    A[Audit storage & baseline metrics] --> B[Install new SSDs]
+    B --> C[Live-migrate VM disks<br/>zero downtime]
+    C --> D[Brief downtime:<br/>containers + TPM state]
+    D --> E[Verify integrity<br/>per VM/CT]
+    E --> F[Clean up orphan disks]
+    F --> G[Documentation & monitoring]
 ```
 
-**Ringkasan tahapan:**
-1. Audit kondisi awal - pemetaan seluruh VM/CT, ukuran disk aktual vs alokasi, cek backup terbaru
-2. **Dua proses dijalankan paralel untuk efisiensi waktu:** instalasi fresh Proxmox OS ke SSD A, bersamaan dengan inisialisasi SSD B sebagai target LVM-Thin storage untuk cloning VM/CT
-3. Migrasi live disk utama untuk seluruh VM Windows (3 VM, @100GB) ke SSD B - zero downtime
-4. Migrasi container LXC (6 CT) via brief stop-move-start - downtime dalam hitungan menit
-5. Migrasi TPM state untuk VM ber-Secure Boot (limitasi platform, butuh VM stop sesaat)
-6. Verifikasi fungsional - login ke tiap VM/CT, cek aplikasi & data
-7. Cleanup disk orphan/duplikat hasil percobaan migrasi yang sempat gagal
-8. Dokumentasi before-after untuk pelaporan
+**Summary of stages:**
+1. Initial audit — mapping every VM/CT, actual vs. allocated disk size, checking latest backups
+2. **Two processes run in parallel for efficiency:** fresh Proxmox OS installation onto SSD A, alongside initializing SSD B as the LVM-Thin target storage for VM/CT cloning
+3. Live migration of the main disk for all Windows VMs (3 VMs, @100GB) onto SSD B — zero downtime
+4. Migration of LXC containers (6 CTs) via brief stop-move-start — downtime measured in minutes
+5. Migration of TPM state for Secure-Boot VMs (platform limitation, requires a brief VM stop)
+6. Functional verification — logging into each VM/CT, checking applications & data
+7. Cleanup of orphaned/duplicate disks left over from migration attempts that had failed
+8. Before-after documentation for reporting
 
-## Insiden & Cara Penyelesaian
+## Incidents & Resolutions
 
-Bagian ini mendokumentasikan masalah nyata yang muncul selama eksekusi - bagian yang menurut saya paling bernilai untuk dipelajari, karena migrasi jarang berjalan 100% mulus.
+This section documents the real issues encountered during execution — arguably the most valuable part to learn from, since migrations rarely go 100% smoothly.
 
-### 1. Interrupted migration meninggalkan orphan disk
+### 1. Interrupted migration leaves an orphan disk
 
-**Gejala:** proses `qm disk move` terputus (koneksi SSH terputus di tengah transfer 100GB), meninggalkan disk parsial di storage tujuan yang tidak terhapus otomatis.
+**Symptom:** a `qm disk move` process was interrupted (SSH connection dropped mid-transfer of a 100GB disk), leaving a partial disk on the destination storage that wasn't automatically cleaned up.
 
 **Diagnosis:**
 ```bash
-pvesm list ssd-storage   # tampak disk duplikat dengan VMID sama
-qm config <vmid>         # config VM tetap menunjuk ke disk lama - migrasi belum cutover
+pvesm list ssd-storage   # a duplicate disk with the same VMID appears
+qm config <vmid>         # the VM config still points to the old disk — migration never cut over
 ```
 
-**Solusi:** hapus disk parsial dengan `pvesm free`, ulangi migrasi di dalam sesi `tmux` agar tahan terhadap disconnect SSH.
+**Resolution:** removed the partial disk with `pvesm free`, then re-ran the migration inside a `tmux` session to make it resilient to SSH disconnects.
 
-### 2. Logical volume "in use" saat menghapus orphan disk
+### 2. Logical volume "in use" when removing the orphan disk
 
-**Gejala:** `pvesm free` gagal dengan pesan `Logical volume in use`, padahal config VM sudah tidak menunjuk ke disk tersebut.
+**Symptom:** `pvesm free` failed with `Logical volume in use`, even though the VM config no longer referenced that disk.
 
 **Diagnosis:**
 ```bash
 fuser -v /dev/<vg>/<lv-name>
 ```
-Ditemukan proses `kvm` milik VM yang sama masih memegang file descriptor ke disk lama - QEMU tidak selalu melepas referensi disk lama segera setelah cutover, terutama pasca migrasi yang sempat gagal sebelumnya.
+Found that the `kvm` process belonging to that same VM was still holding a file descriptor to the old disk — QEMU doesn't always release the old disk reference immediately after cutover, especially following a previously failed migration attempt.
 
-**Solusi:** ditunda hingga VM tersebut direstart secara alami (dijadwalkan bersamaan dengan maintenance window hardware), setelah itu proses QEMU baru tidak lagi membuka disk lama dan penghapusan berhasil.
+**Resolution:** deferred until the VM was naturally restarted (scheduled alongside the hardware maintenance window); afterward the new QEMU process no longer held the old disk open, and removal succeeded.
 
-### 3. Container tidak bisa live-migrate
+### 3. Containers cannot be live-migrated
 
-**Gejala:** `pct move-volume` pada container yang sedang berjalan gagal dengan `cannot move volumes of a running container`.
+**Symptom:** `pct move-volume` on a running container failed with `cannot move volumes of a running container`.
 
-**Root cause:** ini adalah limitasi arsitektural LXC di Proxmox - berbeda dari VM (yang block device-nya diabstraksi lewat QEMU dan bisa di-mirror), rootfs container terikat langsung ke kernel host. Live-migrate storage untuk container memang tidak didukung.
+**Root cause:** this is an architectural limitation of LXC in Proxmox — unlike VMs (whose block devices are abstracted through QEMU and can be mirrored), a container's rootfs is bound directly to the host kernel. Live storage migration for containers simply isn't supported.
 
-**Solusi:** dijadwalkan sebagai brief planned-downtime per container (stop → move → start), diurutkan agar tidak membebani bandwidth I/O yang sama secara bersamaan.
+**Resolution:** scheduled as brief planned downtime per container (stop → move → start), sequenced to avoid saturating the same I/O bandwidth simultaneously.
 
-### 4. TPM state tidak bisa dipindah saat VM aktif
+### 4. TPM state cannot be moved while the VM is running
 
-**Gejala:** `cannot move TPM state while VM is running`.
+**Symptom:** `cannot move TPM state while VM is running`.
 
-**Root cause:** vTPM Proxmox terikat pada siklus hidup proses TPM emulator (`swtpm`) yang berjalan terpisah dari device disk biasa - tidak mendukung live block-mirror.
+**Root cause:** Proxmox's vTPM is tied to the lifecycle of a separate TPM emulator process (`swtpm`), running independently from a regular disk device — it does not support live block-mirroring.
 
-**Solusi:** sama seperti container, dipindahkan saat VM stop sejenak, dijadwalkan bersamaan dengan maintenance window hardware (upgrade RAM & repaste CPU) agar downtime tidak berulang di waktu terpisah.
+**Resolution:** same as containers — moved during a brief VM stop, scheduled together with the hardware maintenance window (RAM upgrade & CPU repaste) to avoid repeated downtime at separate times.
 
-### 5. Konfigurasi VM corrupt pasca migrasi (disk ter-attach ganda)
+### 5. Corrupted VM configuration after migration (disk attached twice)
 
-**Gejala:** setelah serangkaian percobaan migrasi (termasuk yang sempat gagal), satu VM memiliki disk yang sama ter-attach dua kali dengan slot berbeda (`ide0` dan `scsi0` menunjuk volume identik), plus TPM state dengan format path yang tidak valid untuk tipe storage yang dipakai (mencampur konvensi path direktori dengan LVM-Thin).
+**Symptom:** after a series of migration attempts (including some that had failed), one VM ended up with the same disk attached twice under different slots (`ide0` and `scsi0` pointing to the identical volume), plus a TPM state entry using a path format invalid for the storage type in use (mixing directory-style paths with LVM-Thin conventions).
 
-**Diagnosis:** audit menyeluruh `qm config` untuk setiap VM, dibandingkan dengan `pvesm list` untuk memetakan disk yang benar-benar valid vs referensi yang rusak.
+**Diagnosis:** a full audit of `qm config` for every VM, cross-referenced against `pvesm list` to map which disks were genuinely valid versus broken references.
 
-**Solusi:**
+**Resolution:**
 ```bash
-qm set <vmid> --delete <slot-duplikat>
-qm set <vmid> --tpmstate0 <storage>:<volume-benar>,size=4M,version=v2.0
+qm set <vmid> --delete <duplicate-slot>
+qm set <vmid> --tpmstate0 <storage>:<correct-volume>,size=4M,version=v2.0
 ```
-Diverifikasi lewat Windows Disk Management di dalam VM - disk lama yang ter-duplikat otomatis muncul sebagai "Offline" oleh Windows karena disk signature identik dengan disk aktif, mengonfirmasi aman untuk dilepas.
+Verified through Windows Disk Management inside the VM — the old duplicated disk automatically appeared as "Offline" in Windows because its disk signature matched the active disk, confirming it was safe to remove.
 
-## Hasil
+## Results
 
-| Metrik | Sebelum | Sesudah | Perubahan |
+| Metric | Before | After | Change |
 |---|---|---|---|
 | **I/O Delay** | 78.25% | 0.17% | ⬇️ -99.8% |
 | **Load Average** | 35.79 / 33.83 / 26.42 | 1.07 / 1.16 / 1.28 | ⬇️ ~97% |
-| **SWAP Usage** | 99.97% (19.99/20 GiB) | 0.52% (42.78 MiB/8 GiB) | ⬇️ Nyaris hilang |
-| **RAM Total** | 30.85 GiB | 62.30 GiB | ⬆️ 2x (upgrade bersamaan) |
-| **CPU Usage** | 17.98% | 22.02% | Stabil (naik wajar karena sistem lebih responsif) |
-| **Data loss** | - | 0 | ✅ |
-| **VM/CT down permanen** | - | 0 | ✅ |
+| **SWAP Usage** | 99.97% (19.99/20 GiB) | 0.52% (42.78 MiB/8 GiB) | ⬇️ Nearly eliminated |
+| **Total RAM** | 30.85 GiB | 62.30 GiB | ⬆️ 2x (upgraded concurrently) |
+| **CPU Usage** | 17.98% | 22.02% | Stable (a reasonable increase as the system became more responsive) |
+| **Data loss** | — | 0 | ✅ |
+| **Permanent VM/CT downtime** | — | 0 | ✅ |
 
 <table>
 <tr>
 <td width="50%">
 
-**Sebelum Migrasi**
+**Before Migration**
 
 ![Before](assets/before-dashboard.png)
 
 </td>
 <td width="50%">
 
-**Sesudah Migrasi**
+**After Migration**
 
 ![After](assets/after-dashboard.png)
 
@@ -205,28 +205,28 @@ Diverifikasi lewat Windows Disk Management di dalam VM - disk lama yang ter-dupl
 </tr>
 </table>
 
-**Interpretasi:** Load Average yang sangat tinggi (35.79) berbanding CPU usage yang rendah (17.98%) adalah tanda klasik sistem yang macet menunggu I/O, bukan kekurangan daya proses. Setelah migrasi, kedua metrik ini kembali selaras - CPU usage sedikit naik (karena sistem lebih responsif memproses antrian), sementara Load Average turun drastis karena proses tidak lagi menunggu disk.
+**Interpretation:** the very high Load Average (35.79) alongside low CPU usage (17.98%) is a classic sign of a system stalled waiting on I/O, not one lacking processing power. After migration, both metrics realigned — CPU usage rose slightly (the system was more responsive in processing its queue), while Load Average dropped sharply since processes were no longer waiting on disk.
 
 ## Lessons Learned
 
-- **Selalu jalankan operasi disk jangka panjang di dalam `tmux`/`screen`** - koneksi SSH yang terputus di tengah live-migrate meninggalkan state parsial yang menyulitkan cleanup.
-- **QEMU tidak selalu langsung melepas file descriptor disk lama** pasca cutover, terutama setelah percobaan yang sempat gagal - restart proses VM adalah cara paling aman untuk melepas lock yang tersisa, alih-alih memaksa kill process pada VM produksi.
-- **Live-migrate bukan mirroring permanen** - setelah cutover, disk lama membeku dan tidak lagi menerima update. Penting dipahami tim agar tidak keliru menganggap disk lama sebagai cadangan real-time.
-- **Pisahkan komponen yang bisa live-migrate dari yang tidak bisa** (container, TPM state) sejak awal perencanaan, dan jadwalkan yang butuh downtime dalam satu jendela maintenance untuk meminimalkan gangguan berulang.
-- **Audit menyeluruh pasca-migrasi itu wajib**, bukan opsional - bandingkan config setiap VM/CT dengan isi storage fisik untuk menemukan referensi yang rusak/duplikat sebelum dianggap selesai.
+- **Always run long-running disk operations inside `tmux`/`screen`** — an SSH disconnect mid live-migration leaves a partial state that's painful to clean up.
+- **QEMU doesn't always release the old disk's file descriptor immediately** after cutover, especially following a previously failed attempt — restarting the VM process is the safest way to release a lingering lock, rather than force-killing a production VM's process.
+- **Live-migrate is not permanent mirroring** — once cutover completes, the old disk freezes and stops receiving updates. It's important the team understands this so the old disk isn't mistaken for a real-time backup.
+- **Separate live-migratable components from non-live-migratable ones** (containers, TPM state) early in planning, and batch the ones requiring downtime into a single maintenance window to minimize repeated disruption.
+- **A thorough post-migration audit is mandatory, not optional** — cross-check every VM/CT's config against what physically exists in storage to catch broken/duplicate references before calling the job done.
 
 ## Tech Stack
 
 - **Hypervisor:** Proxmox VE 9.x
-- **Storage:** LVM-Thin di atas SSD (sebelumnya di atas HDD)
-- **Guest OS:** Windows Server/11 (VM), Debian/Ubuntu (LXC)
+- **Storage:** LVM-Thin on SSD (previously on HDD)
+- **Guest OS:** Windows Server/11 (VMs), Debian/Ubuntu (LXC)
 - **Migration tools:** `qm`, `pct`, `pvesm`, `lvm2`, `tmux`
 - **Monitoring:** Prometheus, Grafana, Alertmanager, `smartmontools` (smartd)
-- **Notifikasi:** Slack
+- **Notifications:** Slack
 
-## Fase 2: Observability & Proactive Monitoring
+## Phase 2: Observability & Proactive Monitoring
 
-Setelah migrasi storage selesai, dibangun lapisan monitoring 24/7 untuk mencegah insiden serupa (disk mendekati kegagalan, I/O bottleneck) terdeteksi lebih dini - dijalankan di CT terpisah (`SERVER-MONITOR`) agar independen dari workload produksi.
+After the storage migration was complete, a 24/7 monitoring layer was built to catch similar incidents (impending disk failure, I/O bottlenecks) earlier — run in a dedicated CT (`SERVER-MONITOR`) to stay independent of production workloads.
 
 ```mermaid
 graph LR
@@ -238,39 +238,39 @@ graph LR
     E --> F
     F --> G[Grafana Dashboard]
     F --> H[Alertmanager]
-    H -->|alert real-time| I[Slack]
+    H -->|real-time alerts| I[Slack]
 ```
 
-| Komponen | Status |
+| Component | Status |
 |---|---|
-| Prometheus + Grafana + Alertmanager | ✅ Terpasang di CT terdedikasi (`SERVER-MONITOR`) |
-| SMART monitoring (`smartd`) kedua SSD | ✅ Aktif dengan alert |
-| Notifikasi | ✅ Terintegrasi ke Slack |
+| Prometheus + Grafana + Alertmanager | ✅ Deployed on a dedicated CT (`SERVER-MONITOR`) |
+| SMART monitoring (`smartd`) on both SSDs | ✅ Active with alerting |
+| Notifications | ✅ Integrated with Slack |
 
-Dengan ini, potensi kegagalan disk (wear level, bad sector bertambah) maupun regresi performa (I/O Delay naik kembali) dapat terdeteksi dan dinotifikasi secara real-time ke tim, alih-alih baru diketahui setelah gejala dirasakan pengguna - seperti yang terjadi pada insiden awal yang memicu proyek migrasi ini.
+With this in place, potential disk failure (increasing wear level, growing bad sector count) or performance regressions (I/O Delay creeping back up) can be detected and reported to the team in real time — rather than only being noticed after users feel the symptoms, as happened with the original incident that triggered this migration project.
 
-## Fase 3: Konsolidasi ke Single-SSD & Repurposing
+## Phase 3: Single-SSD Consolidation & Repurposing
 
-Setelah RAM/CPU maintenance dan lapisan monitoring berjalan stabil, seluruh isi SSD B (data VM/CT) di-cloning kembali ke SSD A menggunakan pendekatan yang sama seperti migrasi awal (live block-mirror untuk VM, brief-downtime untuk container) - kali ini dengan arah kebalikan, menyatukan semuanya ke satu disk. Downtime yang dibutuhkan hanya sesaat untuk mematikan server saat cutover akhir.
+After the RAM/CPU maintenance and the monitoring layer had proven stable, the entire contents of SSD B (VM/CT data) were cloned back onto SSD A using the same approach as the initial migration (live block-mirror for VMs, brief downtime for containers) — this time in reverse, consolidating everything onto a single disk. The only downtime required was a brief server shutdown for the final cutover.
 
-**Hasil:**
-- SSD A kini berisi penuh: OS Proxmox + seluruh data VM/CT
-- Disk orphan/duplikat hasil proses cloning dibersihkan tuntas pasca konsolidasi
-- SSD B dilepas dari server dan disiapkan untuk direpurpose sebagai storage node/load balancer di lokasi server terpisah - langkah awal menuju arsitektur multi-server
+**Outcome:**
+- SSD A now holds everything: the Proxmox OS plus all VM/CT data
+- Orphaned/duplicate disks left over from the cloning process were fully cleaned up
+- SSD B was removed from the server and prepared for repurposing as a storage node/load balancer at a separate server location — the first step toward a multi-server architecture
 
-Pendekatan "clone lalu lepas" ini dipilih karena polanya sudah terbukti aman dari migrasi Fase 1 - mengurangi risiko dibanding pendekatan baru yang belum teruji.
+The "clone then remove" approach was chosen because the pattern had already proven safe during the Phase 1 migration — reducing risk compared to trying an untested new approach.
 
-## Tindak Lanjut
+## Next Steps
 
-- [x] ~~Konsolidasi ke 1 SSD~~ - selesai, lihat [Fase 3](#fase-3-konsolidasi-ke-single-ssd--repurposing)
-- [x] ~~Repurpose SSD B sebagai storage node/load balancer di server terpisah~~ - SSD sudah dilepas, siap dipasang di lokasi server tujuan
-- [x] ~~Implementasi monitoring 24/7 (SMART health check, Prometheus + Grafana + Alertmanager)~~ - selesai, lihat [Fase 2](#fase-2-observability--proactive-monitoring)
-- [x] ~~Cleanup akhir disk orphan yang tersisa~~ - selesai bersamaan konsolidasi Fase 3
-- [ ] Tuning threshold alert (IO Delay, SWAP, suhu SSD) berdasarkan baseline operasional beberapa minggu ke depan
-- [ ] Setup load balancer pada SSD B di server lokasi baru (proyek lanjutan)
+- [x] ~~Consolidate onto a single SSD~~ — done, see [Phase 3](#phase-3-single-ssd-consolidation--repurposing)
+- [x] ~~Repurpose SSD B as a storage node/load balancer at a separate server~~ — SSD removed and ready for the target location
+- [x] ~~Implement 24/7 monitoring (SMART health checks, Prometheus + Grafana + Alertmanager)~~ — done, see [Phase 2](#phase-2-observability--proactive-monitoring)
+- [x] ~~Final cleanup of remaining orphan disks~~ — completed alongside the Phase 3 consolidation
+- [ ] Tune alert thresholds (I/O Delay, SWAP, SSD temperature) based on a few weeks of operational baseline
+- [ ] Set up the load balancer on SSD B at the new server location (follow-up project)
 
-> Rencana redundansi (ZFS Mirror/hardware RAID pada MegaRAID controller) dievaluasi ulang mengingat arah infrastruktur bergerak ke topologi multi-server, bukan lagi dual-disk pada satu server yang sama.
+> Redundancy plans (ZFS Mirror / hardware RAID on the MegaRAID controller) were re-evaluated given that the infrastructure direction is moving toward a multi-server topology rather than a dual-disk setup on a single server.
 
 ---
 
-<sub>Catatan: nama aplikasi, alamat IP, kredensial, dan detail yang mengidentifikasi klien telah dihilangkan/disamarkan dari studi kasus ini untuk menjaga kerahasiaan data produksi.</sub>
+<sub>Note: application names, IP addresses, credentials, and client-identifying details have been removed/anonymized from this case study to preserve production data confidentiality.</sub>
