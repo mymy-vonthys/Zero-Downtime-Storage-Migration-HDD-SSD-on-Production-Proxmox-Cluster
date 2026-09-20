@@ -1,6 +1,6 @@
-![Status](https://img.shields.io/badge/status-completed-brightgreen)
-![Platform](https://img.shields.io/badge/platform-Proxmox%20VE-orange)
-![Downtime](https://img.shields.io/badge/downtime-near--zero-blue)
+![Status](https://shields.io)
+![Platform](https://shields.io)
+![Downtime](https://shields.io)
 
 ---
 
