@@ -1,13 +1,12 @@
-![Status](https://shields.io)
-![Platform](https://shields.io)
-![Downtime](https://shields.io)
+![Status](https://img.shields.io/badge/status-completed-brightgreen)
+![Platform](https://img.shields.io/badge/platform-Proxmox%20VE-orange)
+![Downtime](https://img.shields.io/badge/downtime-near--zero-blue)
 
 ---
 
 ## TL;DR
 
 | | |
-|---|---|
 | **Masalah** | Server produksi mengalami I/O Delay 78%, Load Average >35, SWAP hampir penuh (99.97%) |
 | **Constraint** | Tidak boleh downtime — 9 VM/CT sedang aktif melayani produksi (database, CI/CD, backup server, dll) |
 | **Solusi** | Live block-mirror migration (`qm disk move`) dari HDD ke SSD, dikombinasikan dengan brief-downtime untuk LXC container (limitasi platform) |
