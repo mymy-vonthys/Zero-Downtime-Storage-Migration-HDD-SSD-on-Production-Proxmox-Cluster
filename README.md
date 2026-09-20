@@ -7,6 +7,7 @@
 ## TL;DR
 
 | | |
+| --- | --- |
 | **Masalah** | Server produksi mengalami I/O Delay 78%, Load Average >35, SWAP hampir penuh (99.97%) |
 | **Constraint** | Tidak boleh downtime — 9 VM/CT sedang aktif melayani produksi (database, CI/CD, backup server, dll) |
 | **Solusi** | Live block-mirror migration (`qm disk move`) dari HDD ke SSD, dikombinasikan dengan brief-downtime untuk LXC container (limitasi platform) |
